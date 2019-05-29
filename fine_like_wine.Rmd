@@ -3,6 +3,18 @@ title: "TidyTuesday 2019-05-28: Wine Rankings"
 output: html_notebook
 ---
 
+```{r}
+library(tibble, quietly = TRUE)
+library(Matrix, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(purrr, quietly = TRUE)
+library(irlba, quietly = TRUE)
+library(uwot, quietly = TRUE)
+library(Rphenograph, quietly = TRUE)
+library(colorway)
+```
+
+
 This notebook is an exploration of wine ratings, as described here:
 https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-05-28
 
@@ -41,11 +53,11 @@ That looks pretty good! Mostly not missing information, and at least a couple hu
 
 To start this analysis, I want a set of all of the words in the descriptions.
 ```{r}
-library(purrr)
-
 split_descriptions <- map(wine_ratings$description,
                           function(x) {
-                            splits <- strsplit(x, "[ ,\\.\t]+")
+                            # Remove separating characters/punctuation
+                            # Keep dashes for things like "chunky-feeling"
+                            splits <- strsplit(x, "[ ,\\.\t;:()]+")
                             tolower(unlist(splits))
                           })
 
@@ -54,32 +66,32 @@ all_words <- unique(unlist(split_descriptions))
 length(all_words)
 ```
 
-~52k different words - that's a decent set of features.
+~48k different words - that's a decent set of features.
 
-Let's build a sparse matrix of the occurences of these words for each description.
+Let's build a sparse matrix of the occurrences of these words for each description.
 ```{r}
-library(Matrix)
-
-sparse_i <- map(split_descriptions,
-                function(desc_words) {
-                  unique_words <- unique(desc_words)
-                  which(all_words %in% unique_words)
-                })
-
-sparse_p <- c(0, cumsum(map_int(sparse_i, length)))
-
-binary_matrix <- sparseMatrix(i = unlist(sparse_i),
-                              p = sparse_p,
-                              x = rep(1, length(unlist(sparse_i))),
-                              dims = c(length(all_words),
-                                       length(sparse_i)))
-rownames(binary_matrix) <- all_words
-```
-
-That's pretty slow, so I'll save the matrix for later:
-```{r}
-saveRDS(binary_matrix,
+if(!file.exists("binary_matrix.rda")) {
+  sparse_i <- map(split_descriptions,
+                  function(desc_words) {
+                    unique_words <- unique(desc_words)
+                    which(all_words %in% unique_words)
+                  })
+  
+  sparse_p <- c(0, cumsum(map_int(sparse_i, length)))
+  
+  binary_matrix <- sparseMatrix(i = unlist(sparse_i),
+                                p = sparse_p,
+                                x = rep(1, length(unlist(sparse_i))),
+                                dims = c(length(all_words),
+                                         length(sparse_i)))
+  rownames(binary_matrix) <- all_words
+  
+  saveRDS(binary_matrix,
         file = "binary_matrix.rda")
+} else {
+  binary_matrix <- readRDS("binary_matrix.rda")
+}
+
 ```
 
 
@@ -88,13 +100,37 @@ To find similarities, let's use TF-IDF (Term Frequency x Inverse Document Freque
 This is inspired by analysis of sparse single-cell ATAC-seq data by Cusanovich and Hill, provided here:
 https://github.com/shendurelab/mouse-atac/blob/master/dim_reduction/dim_reduction.R
 
+First, we'll remove common and non-descriptive words. Let's look at the words with > 5,000 occurrences:
 ```{r}
 t_binary_matrix <- t(binary_matrix)
 
-word_occurences <- Matrix::colSums(t_binary_matrix)
-occurence_threshold <- nrow(t_binary_matrix) * 0.001
+word_occurrences <- Matrix::colSums(t_binary_matrix)
 
-ncounts <- t(t_binary_matrix[,word_occurences >= occurence_threshold])
+word_occurrences[word_occurrences > 5e3]
+```
+
+There's a mix here of important descriptive terms and extremely common words that aren't very informative. setting a hard cutoff may not be the way to go. Instead, I'll manually curate a blacklist:
+```{r}
+word_blacklist <- c("a","it","in","from","wine","for","and","that","an","the","of","has","on",
+                    "are","with","now","to","by","this","at","is","as","it's","its",
+                    "or","so","also","there's","be","there")
+
+word_occurrences[word_occurrences > 5e3 & !all_words %in% word_blacklist]
+```
+
+We also need to trim things that are too rare to be informative for clustering. For now, let's go with words that appear at least 10 times. 
+
+```{r}
+occurrence_threshold <- 10
+
+keep_words <- word_occurrences >= occurrence_threshold & !names(word_occurrences) %in% word_blacklist
+
+sum(keep_words)
+```
+
+Then, we'll filter the matrix and perform TF-IDF normalization, which will increase the weight for rare words:
+```{r}
+ncounts <- t(t_binary_matrix[,keep_words])
 
 ## Normalize the data with TF-IDF
 nfreqs <- t(t(ncounts) / Matrix::colSums(ncounts))
@@ -105,9 +141,8 @@ tf_idf_counts@x <- log1p(tf_idf_counts@x * 1e5)
 
 Here's the SVD step:
 ```{r}
-library(irlba)
-
 set.seed(0)
+
 SVD <- irlba(tf_idf_counts, 50, 50, maxit=1000)
 d_diagtsne <- matrix(0, nrow=length(SVD$d), ncol=length(SVD$d))
 diag(d_diagtsne) <- SVD$d
@@ -117,8 +152,6 @@ colnames(vd) <- paste0('pca_', 1:ncol(vd))
 
 Now we can use UMAP to get a 2d view of the reviews (Rtsne was too slow):
 ```{r}
-library(uwot)
-
 umap_results <- umap(vd,
                      n_neighbors = 10,
                      min_dist = 0.5,
@@ -239,4 +272,25 @@ map(names(variety_freq)[1:10],
 ```
 
 Looks like a couple of these separate well, but others are pretty spread out.
+
+Let's try clustering the descriptions using Rphenograph:
+```{r}
+pg_results <- Rphenograph(umap_results,
+                          k = 30)
+```
+
+```{r}
+pg_clusters <- as.character(membership(pg_results[[2]]))
+pg_colors <- varibow(length(unique(pg_clusters)))
+
+ggplot() +
+  geom_point(data = wine_ratings,
+             aes(x = umap_1,
+                 y = umap_2,
+                 color = pg_clusters),
+             size = 0.1) +
+  scale_color_manual(breaks = unique(pg_clusters),
+                     values = pg_colors) +
+  theme(legend.position = "none")
+```
 
