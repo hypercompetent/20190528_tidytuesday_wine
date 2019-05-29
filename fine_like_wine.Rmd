@@ -1,0 +1,242 @@
+---
+title: "TidyTuesday 2019-05-28: Wine Rankings"
+output: html_notebook
+---
+
+This notebook is an exploration of wine ratings, as described here:
+https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-05-28
+
+Retrieve data
+```{r}
+wine_ratings <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-05-28/winemag-data-130k-v2.csv")
+```
+
+130,000 ratings! Let's check them out:
+```{r}
+str(wine_ratings)
+```
+
+How many unique wines are there?
+```{r}
+length(unique(wine_ratings$title))
+```
+
+OK, mostly one rating per wine, then. Are there exceptions?
+```{r}
+hist(table(wine_ratings$title), breaks = 20)
+```
+
+Just a couple with up to 10 ratings.
+
+Since I'm interested in descriptions, let's see how many have a description, and how long they are per rating:
+```{r}
+sum(!is.na(wine_ratings$description))
+```
+
+```{r}
+hist(nchar(wine_ratings$description))
+```
+
+That looks pretty good! Mostly not missing information, and at least a couple hundred characters per wine to play with.
+
+To start this analysis, I want a set of all of the words in the descriptions.
+```{r}
+library(purrr)
+
+split_descriptions <- map(wine_ratings$description,
+                          function(x) {
+                            splits <- strsplit(x, "[ ,\\.\t]+")
+                            tolower(unlist(splits))
+                          })
+
+all_words <- unique(unlist(split_descriptions))
+
+length(all_words)
+```
+
+~52k different words - that's a decent set of features.
+
+Let's build a sparse matrix of the occurences of these words for each description.
+```{r}
+library(Matrix)
+
+sparse_i <- map(split_descriptions,
+                function(desc_words) {
+                  unique_words <- unique(desc_words)
+                  which(all_words %in% unique_words)
+                })
+
+sparse_p <- c(0, cumsum(map_int(sparse_i, length)))
+
+binary_matrix <- sparseMatrix(i = unlist(sparse_i),
+                              p = sparse_p,
+                              x = rep(1, length(unlist(sparse_i))),
+                              dims = c(length(all_words),
+                                       length(sparse_i)))
+rownames(binary_matrix) <- all_words
+```
+
+That's pretty slow, so I'll save the matrix for later:
+```{r}
+saveRDS(binary_matrix,
+        file = "binary_matrix.rda")
+```
+
+
+To find similarities, let's use TF-IDF (Term Frequency x Inverse Document Frequency) to find terms that are common enough to compare, and weight the terms for SVD.
+
+This is inspired by analysis of sparse single-cell ATAC-seq data by Cusanovich and Hill, provided here:
+https://github.com/shendurelab/mouse-atac/blob/master/dim_reduction/dim_reduction.R
+
+```{r}
+t_binary_matrix <- t(binary_matrix)
+
+word_occurences <- Matrix::colSums(t_binary_matrix)
+occurence_threshold <- nrow(t_binary_matrix) * 0.001
+
+ncounts <- t(t_binary_matrix[,word_occurences >= occurence_threshold])
+
+## Normalize the data with TF-IDF
+nfreqs <- t(t(ncounts) / Matrix::colSums(ncounts))
+tf_idf_counts <- nfreqs * log(1 + ncol(ncounts) / Matrix::rowSums(ncounts))
+
+tf_idf_counts@x <- log1p(tf_idf_counts@x * 1e5)
+```
+
+Here's the SVD step:
+```{r}
+library(irlba)
+
+set.seed(0)
+SVD <- irlba(tf_idf_counts, 50, 50, maxit=1000)
+d_diagtsne <- matrix(0, nrow=length(SVD$d), ncol=length(SVD$d))
+diag(d_diagtsne) <- SVD$d
+vd <- t(d_diagtsne %*% t(SVD$v))
+colnames(vd) <- paste0('pca_', 1:ncol(vd))
+```
+
+Now we can use UMAP to get a 2d view of the reviews (Rtsne was too slow):
+```{r}
+library(uwot)
+
+umap_results <- umap(vd,
+                     n_neighbors = 10,
+                     min_dist = 0.5,
+                     verbose = TRUE)
+
+```
+
+Let's see if there's any overall structure:
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(umap_results)
+names(umap_df) <- c("umap_1","umap_2")
+
+ggplot(umap_df) +
+  geom_point(aes(x = umap_1,
+                 y = umap_2),
+             alpha = 0.1,
+             size = 0.1)
+```
+
+Interesting - not a lot of distinct islands. Looks pretty continuous. Let's take a look at a couple of terms that I would think are pretty common - "red" and "white" - and see how they're distributed.
+
+```{r}
+plot_df <- umap_df
+plot_df$red <- t_binary_matrix[,"red"]
+plot_df$white <- t_binary_matrix[,"white"]
+plot_df$rose <- t_binary_matrix[,"rose"]
+plot_df$category <- "neither"
+plot_df$category[plot_df$red == 1 & plot_df$white == 0] <- "red"
+plot_df$category[plot_df$red == 0 & plot_df$white == 1] <- "white"
+plot_df$category[plot_df$red == 1 & plot_df$white == 1] <- "both"
+plot_df$category[plot_df$rose == 1] <- "rose"
+
+bg <- plot_df[plot_df$category == "neither",]
+fg <- plot_df[plot_df$category != "neither",]
+
+ggplot() +
+  geom_point(data = fg,
+             aes(x = umap_1,
+                 y = umap_2,
+             color = category),
+             alpha = 0.1)
+
+ggplot() +
+  geom_point(data = fg[fg$category == "red",],
+             aes(x = umap_1,
+                 y = umap_2),
+             color = "red",
+             size = 0.1) +
+  scale_color_identity()
+
+ggplot() +
+  geom_point(data = fg[fg$category == "white",],
+             aes(x = umap_1,
+                 y = umap_2),
+             color = "lightgreen",
+             size = 0.1) + 
+  scale_color_identity()
+
+ggplot() +
+  geom_point(data = fg[fg$category == "rose",],
+             aes(x = umap_1,
+                 y = umap_2),
+             color = "pink",
+             size = 0.1) + 
+  scale_color_identity()
+```
+
+Interesting. Looks like there's some separation of reviews based on these terms. The group on the left seems to be a mix of red, white, and rose.
+
+```{r}
+wine_ratings <- cbind(wine_ratings, umap_df)
+```
+
+
+Do ratings group?
+```{r}
+ggplot() +
+  geom_point(data = wine_ratings,
+             aes(x = umap_1,
+                 y = umap_2,
+                 color = points),
+             size = 0.1) +
+  scale_color_viridis_c()
+```
+No - that's interesting!
+
+How about prices?
+```{r}
+ggplot() +
+  geom_point(data = wine_ratings[!is.na(wine_ratings$price),],
+             aes(x = umap_1,
+                 y = umap_2,
+                 color = log10(price + 1)),
+             size = 0.1) +
+  scale_color_viridis_c()
+```
+Also doesn't look too strong. How about variety? That should group based on terms:
+
+```{r}
+variety_freq <- table(wine_ratings$variety)
+variety_freq <- variety_freq[order(variety_freq, decreasing = TRUE)]
+top_varieties <- wine_ratings[wine_ratings$variety %in% names(variety_freq[1:10]),]
+
+map(names(variety_freq)[1:10],
+    function(x) {
+      variety_df <- top_varieties[top_varieties$variety == x,]
+      ggplot() +
+        geom_point(data = variety_df,
+                   aes(x = umap_1,
+                       y = umap_2),
+                   size = 0.1) +
+        scale_x_continuous(limits = range(top_varieties$umap_1)) +
+        scale_y_continuous(limits = range(top_varieties$umap_2)) +
+        ggtitle(x)
+    })
+```
+
+Looks like a couple of these separate well, but others are pretty spread out.
+
